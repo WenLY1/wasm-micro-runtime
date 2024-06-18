@@ -223,6 +223,34 @@ aot_check_memory_overflow(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
         && !(is_local_of_aot_value
              && aot_checked_addr_list_find(func_ctx, local_idx_of_aot_value,
                                            offset, bytes))) {
+#if WASM_ENABLE_AOT_NATIVE_BOUNDS_CHECK != 0
+        LLVMValueRef param_values[3], value;
+        LLVMTypeRef param_types[3];
+        static LLVMTypeRef ret_type = 0, func_type = 0, func_ptr_type= 0;
+        static LLVMValueRef func;
+        uint32 argc = 3;
+
+        param_types[0] = INT8_PTR_TYPE;
+        param_types[1] = I64_TYPE;
+        param_types[2] = I32_TYPE;
+        ret_type = INT8_PTR_TYPE;
+
+        param_values[0] = func_ctx->aot_inst;
+        param_values[1] = offset1;
+        param_values[2] = I32_CONST(bytes);
+
+        if (!ret_type || !func_type)
+        {
+            printf("GET_AOT_FUNCTION\n");
+            GET_AOT_FUNCTION(aot_bounds_check, argc);
+        }
+
+        if (!(maddr = LLVMBuildCall2(comp_ctx->builder, func_type, func,
+                                     param_values, argc, "aot_bounds_check1"))) {
+            aot_set_last_error("llvm build call failed.");
+            goto fail;
+        }
+#else
         uint32 init_page_count =
             comp_ctx->comp_data->memories[0].init_page_count;
         if (init_page_count == 0) {
@@ -277,6 +305,7 @@ aot_check_memory_overflow(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
                                            offset, bytes))
                 goto fail;
         }
+#endif
     }
 
     if (!enable_segue) {

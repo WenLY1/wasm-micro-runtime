@@ -2729,6 +2729,21 @@ aot_enlarge_memory(AOTModuleInstance *module_inst, uint32 inc_page_count)
     return wasm_enlarge_memory(module_inst, inc_page_count);
 }
 
+uintptr_t
+aot_bounds_check(AOTModuleInstance *module_inst, uint64 offset,
+                        uint32 bytes)
+{
+    WASMMemoryInstance *memory = aot_get_default_memory(module_inst);
+    uint64 linear_memory_size = memory->memory_data_size;
+
+    if (offset + bytes <= linear_memory_size)
+    {
+        return memory->memory_data + offset;
+    }
+    // execption
+    return 1;
+}
+
 bool
 aot_invoke_native(WASMExecEnv *exec_env, uint32 func_idx, uint32 argc,
                   uint32 *argv)
