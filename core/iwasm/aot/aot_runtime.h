@@ -203,7 +203,6 @@ typedef struct AOTModule {
     uint32 malloc_func_index;
     uint32 free_func_index;
     uint32 retain_func_index;
-
     /* AOTed code */
     void *code;
     uint32 code_size;
@@ -535,6 +534,10 @@ aot_call_function(WASMExecEnv *exec_env, AOTFunctionInstance *function,
  */
 void
 aot_set_exception(AOTModuleInstance *module_inst, const char *exception);
+
+uintptr_t
+aot_bounds_check(AOTModuleInstance *module_inst, uint64 offset,
+                        uint32 bytes);
 
 void
 aot_set_exception_with_id(AOTModuleInstance *module_inst, uint32 id);

@@ -3090,7 +3090,7 @@ wasm_runtime_module_shared_malloc(WASMModuleInstanceCommon *module_inst,
                                          size, p_native_addr);
 #endif
 #if WASM_ENABLE_AOT != 0
-        // TODO
+    printf("Not implemented\n");
 #endif
     return 0;
 }
@@ -3109,6 +3109,7 @@ wasm_runtime_module_shared_free(WASMModuleInstanceCommon *module_inst,
     // TODO
 #endif
 }
+
 #endif
 
 uint64

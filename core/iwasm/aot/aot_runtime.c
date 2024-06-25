@@ -2703,6 +2703,7 @@ aot_module_free(AOTModuleInstance *module_inst, uint64 ptr)
     aot_module_free_internal(module_inst, NULL, ptr);
 }
 
+
 uint64
 aot_module_dup_data(AOTModuleInstance *module_inst, const char *src,
                     uint64 size)
@@ -2728,6 +2729,35 @@ aot_enlarge_memory(AOTModuleInstance *module_inst, uint32 inc_page_count)
 {
     return wasm_enlarge_memory(module_inst, inc_page_count);
 }
+
+uintptr_t
+aot_bounds_check(AOTModuleInstance *module_inst, uint64 offset,
+                        uint32 bytes)
+{
+    AOTMemoryInstance *memory_inst;
+
+    WASMMemoryInstance *memory = aot_get_default_memory(module_inst);
+    uint64 linear_memory_size = memory->memory_data_size;
+
+    if (offset + bytes <= linear_memory_size)
+    {
+        return memory->memory_data + offset;
+    }
+#if WASM_ENABLE_MEMORY64 == 0
+    else if (offset + bytes >= UINT32_MAX - module_inst->shared_heap->size && offset + bytes <= UINT32_MAX)
+    {
+        return module_inst->shared_heap->data + offset;
+    }
+#else
+    else if (offset + bytes >= UINT64_MAX - module_inst->shared_heap->size && offset + bytes <= UINT64_MAX)
+    {
+        return module_inst->shared_heap->data + offset;
+    }
+#endif
+    // execption
+    return 1;
+}
+
 
 bool
 aot_invoke_native(WASMExecEnv *exec_env, uint32 func_idx, uint32 argc,

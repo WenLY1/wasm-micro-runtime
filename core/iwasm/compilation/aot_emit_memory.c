@@ -94,6 +94,153 @@ get_memory_check_bound(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
 static LLVMValueRef
 get_memory_curr_page_count(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx);
 
+#if WASM_ENABLE_SHARED_HEAP != 0
+
+LLVMValueRef
+aot_check_memory_overflow(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
+                          mem_offset_t offset, uint32 bytes, bool enable_segue)
+{
+    LLVMValueRef offset_const =
+        MEMORY64_COND_VALUE(I64_CONST(offset), I32_CONST(offset));
+    LLVMValueRef addr, maddr, offset1;
+    LLVMValueRef mem_base_addr;
+    bool is_target_64bit;
+#if WASM_ENABLE_SHARED_MEMORY != 0
+    bool is_shared_memory =
+        comp_ctx->comp_data->memories[0].flags & SHARED_MEMORY_FLAG;
+#endif
+
+    is_target_64bit = (comp_ctx->pointer_size == sizeof(uint64)) ? true : false;
+
+    if (comp_ctx->is_indirect_mode
+        && aot_intrinsic_check_capability(
+            comp_ctx, MEMORY64_COND_VALUE("i64.const", "i32.const"))) {
+        WASMValue wasm_value;
+#if WASM_ENABLE_MEMORY64 != 0
+        if (IS_MEMORY64) {
+            wasm_value.i64 = offset;
+        }
+        else
+#endif
+        {
+            wasm_value.i32 = (int32)offset;
+        }
+        offset_const = aot_load_const_from_table(
+            comp_ctx, func_ctx->native_symbol, &wasm_value,
+            MEMORY64_COND_VALUE(VALUE_TYPE_I64, VALUE_TYPE_I32));
+        if (!offset_const) {
+            return NULL;
+        }
+    }
+    else {
+        CHECK_LLVM_CONST(offset_const);
+    }
+
+    /* Get memory base address and memory data size */
+    if (func_ctx->mem_space_unchanged
+#if WASM_ENABLE_SHARED_MEMORY != 0
+        || is_shared_memory
+#endif
+    ) {
+        mem_base_addr = func_ctx->mem_info[0].mem_base_addr;
+    }
+    else {
+        if (!(mem_base_addr = LLVMBuildLoad2(
+                  comp_ctx->builder, OPQ_PTR_TYPE,
+                  func_ctx->mem_info[0].mem_base_addr, "mem_base"))) {
+            aot_set_last_error("llvm build load failed.");
+            goto fail;
+        }
+    }
+
+    POP_MEM_OFFSET(addr);
+
+    /*
+     * Note: not throw the integer-overflow-exception here since it must
+     * have been thrown when converting float to integer before
+     */
+    /* return address directly if constant offset and inside memory space */
+    if (LLVMIsEfficientConstInt(addr)) {
+        uint64 mem_offset =
+            (uint64)LLVMConstIntGetZExtValue(addr) + (uint64)offset;
+        uint32 num_bytes_per_page =
+            comp_ctx->comp_data->memories[0].num_bytes_per_page;
+        uint32 init_page_count =
+            comp_ctx->comp_data->memories[0].init_page_count;
+        uint64 mem_data_size = (uint64)num_bytes_per_page * init_page_count;
+
+        if (mem_offset + bytes <= mem_data_size) {
+            /* inside memory space */
+            if (comp_ctx->pointer_size == sizeof(uint64))
+                offset1 = I64_CONST(mem_offset);
+            else
+                offset1 = I32_CONST((uint32)mem_offset);
+            CHECK_LLVM_CONST(offset1);
+            if (!enable_segue) {
+                if (!(maddr = LLVMBuildInBoundsGEP2(comp_ctx->builder,
+                                                    INT8_TYPE, mem_base_addr,
+                                                    &offset1, 1, "maddr"))) {
+                    aot_set_last_error("llvm build add failed.");
+                    goto fail;
+                }
+            }
+            else {
+                if (!(maddr = LLVMBuildIntToPtr(comp_ctx->builder, offset1,
+                                                INT8_PTR_TYPE_GS, "maddr"))) {
+                    aot_set_last_error("llvm build IntToPtr failed.");
+                    goto fail;
+                }
+            }
+            return maddr;
+        }
+    }
+
+    if (is_target_64bit) {
+        if (!(offset_const = LLVMBuildZExt(comp_ctx->builder, offset_const,
+                                           I64_TYPE, "offset_i64"))
+            || !(addr = LLVMBuildZExt(comp_ctx->builder, addr, I64_TYPE,
+                                      "addr_i64"))) {
+            aot_set_last_error("llvm build zero extend failed.");
+            goto fail;
+        }
+    }
+
+    /* offset1 = offset + addr; */
+    BUILD_OP(Add, offset_const, addr, offset1, "offset1");
+
+    LLVMValueRef param_values[3], value;
+    LLVMTypeRef param_types[3];
+    static LLVMTypeRef ret_type = 0, func_type = 0, func_ptr_type= 0, func;
+    uint32 argc = 3;
+
+    param_types[0] = INT8_PTR_TYPE;
+    param_types[1] = I64_TYPE;
+    param_types[2] = I32_TYPE;
+    ret_type = INT8_PTR_TYPE;
+
+    param_values[0] = func_ctx->aot_inst;
+    param_values[1] = offset1;
+    param_values[2] = I32_CONST(bytes);
+
+    if (!ret_type || !func_type)
+    {
+        printf("GET_AOT_FUNCTION(aot_bounds_check, argc)\n");
+        GET_AOT_FUNCTION(aot_bounds_check, argc);
+    }
+
+    if (!(maddr = LLVMBuildCall2(comp_ctx->builder, func_type, func,
+                                 param_values, argc, "aot_bounds_check"))) {
+        aot_set_last_error("llvm build call failed.");
+        goto fail;
+    }
+
+
+    return maddr;
+fail:
+    return NULL;
+}
+
+#else
 LLVMValueRef
 aot_check_memory_overflow(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
                           mem_offset_t offset, uint32 bytes, bool enable_segue)
@@ -307,6 +454,7 @@ aot_check_memory_overflow(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
 fail:
     return NULL;
 }
+#endif
 
 #define BUILD_PTR_CAST(ptr_type)                                           \
     do {                                                                   \
