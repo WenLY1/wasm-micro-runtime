@@ -94,6 +94,37 @@ get_memory_check_bound(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
 static LLVMValueRef
 get_memory_curr_page_count(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx);
 
+static LLVMValueRef
+aot_call_runtime_bounds_check(AOTCompContext *comp_ctx,
+                              AOTFuncContext *func_ctx, LLVMValueRef offset,
+                              uint32 bytes)
+{
+    LLVMValueRef param_values[3], value, maddr, func;
+    LLVMTypeRef param_types[3], ret_type = 0, func_type = 0, func_ptr_type = 0;
+    ;
+    uint32 argc = 3;
+
+    param_types[0] = INT8_PTR_TYPE;
+    param_types[1] = I64_TYPE;
+    param_types[2] = I32_TYPE;
+    ret_type = INT8_PTR_TYPE;
+
+    param_values[0] = func_ctx->aot_inst;
+    param_values[1] = offset;
+    param_values[2] = I32_CONST(bytes);
+
+    GET_AOT_FUNCTION(aot_bounds_check, argc);
+
+    if (!(maddr = LLVMBuildCall2(comp_ctx->builder, func_type, func,
+                                 param_values, argc, "maddr"))) {
+        aot_set_last_error("llvm build call failed.");
+        goto fail;
+    }
+    return maddr;
+fail:
+    return NULL;
+}
+
 LLVMValueRef
 aot_check_memory_overflow(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
                           mem_offset_t offset, uint32 bytes, bool enable_segue,
@@ -257,18 +288,57 @@ aot_check_memory_overflow(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
         && !(is_local_of_aot_value
              && aot_checked_addr_list_find(func_ctx, local_idx_of_aot_value,
                                            offset, bytes))) {
-        uint32 init_page_count =
-            comp_ctx->comp_data->memories[0].init_page_count;
-        if (init_page_count == 0) {
-            LLVMValueRef mem_size;
+        if (comp_ctx->enable_runtime_bound_check) {
 
-            if (!(mem_size = get_memory_curr_page_count(comp_ctx, func_ctx))) {
+            if (!(maddr = aot_call_runtime_bounds_check(comp_ctx, func_ctx, offset1, bytes)))
+            {
                 goto fail;
             }
-            BUILD_ICMP(LLVMIntEQ, mem_size,
-                       MEMORY64_COND_VALUE(I64_ZERO, I32_ZERO), cmp, "is_zero");
-            ADD_BASIC_BLOCK(check_succ, "check_mem_size_succ");
+        }
+        else {
+            uint32 init_page_count =
+                comp_ctx->comp_data->memories[0].init_page_count;
+            if (init_page_count == 0) {
+                LLVMValueRef mem_size;
+
+                if (!(mem_size =
+                          get_memory_curr_page_count(comp_ctx, func_ctx))) {
+                    goto fail;
+                }
+                BUILD_ICMP(LLVMIntEQ, mem_size,
+                           MEMORY64_COND_VALUE(I64_ZERO, I32_ZERO), cmp,
+                           "is_zero");
+                ADD_BASIC_BLOCK(check_succ, "check_mem_size_succ");
+                LLVMMoveBasicBlockAfter(check_succ, block_curr);
+                if (!aot_emit_exception(comp_ctx, func_ctx,
+                                        EXCE_OUT_OF_BOUNDS_MEMORY_ACCESS, true,
+                                        cmp, check_succ)) {
+                    goto fail;
+                }
+
+                SET_BUILD_POS(check_succ);
+                block_curr = check_succ;
+            }
+
+            if (!(mem_check_bound =
+                      get_memory_check_bound(comp_ctx, func_ctx, bytes))) {
+                goto fail;
+            }
+
+            if (is_target_64bit) {
+                BUILD_ICMP(LLVMIntUGT, offset1, mem_check_bound, cmp, "cmp");
+            }
+            else {
+                /* Check integer overflow */
+                BUILD_ICMP(LLVMIntULT, offset1, addr, cmp1, "cmp1");
+                BUILD_ICMP(LLVMIntUGT, offset1, mem_check_bound, cmp2, "cmp2");
+                BUILD_OP(Or, cmp1, cmp2, cmp, "cmp");
+            }
+
+            /* Add basic blocks */
+            ADD_BASIC_BLOCK(check_succ, "check_succ");
             LLVMMoveBasicBlockAfter(check_succ, block_curr);
+
             if (!aot_emit_exception(comp_ctx, func_ctx,
                                     EXCE_OUT_OF_BOUNDS_MEMORY_ACCESS, true, cmp,
                                     check_succ)) {
@@ -276,40 +346,12 @@ aot_check_memory_overflow(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
             }
 
             SET_BUILD_POS(check_succ);
-            block_curr = check_succ;
-        }
 
-        if (!(mem_check_bound =
-                  get_memory_check_bound(comp_ctx, func_ctx, bytes))) {
-            goto fail;
-        }
-
-        if (is_target_64bit) {
-            BUILD_ICMP(LLVMIntUGT, offset1, mem_check_bound, cmp, "cmp");
-        }
-        else {
-            /* Check integer overflow */
-            BUILD_ICMP(LLVMIntULT, offset1, addr, cmp1, "cmp1");
-            BUILD_ICMP(LLVMIntUGT, offset1, mem_check_bound, cmp2, "cmp2");
-            BUILD_OP(Or, cmp1, cmp2, cmp, "cmp");
-        }
-
-        /* Add basic blocks */
-        ADD_BASIC_BLOCK(check_succ, "check_succ");
-        LLVMMoveBasicBlockAfter(check_succ, block_curr);
-
-        if (!aot_emit_exception(comp_ctx, func_ctx,
-                                EXCE_OUT_OF_BOUNDS_MEMORY_ACCESS, true, cmp,
-                                check_succ)) {
-            goto fail;
-        }
-
-        SET_BUILD_POS(check_succ);
-
-        if (is_local_of_aot_value) {
-            if (!aot_checked_addr_list_add(func_ctx, local_idx_of_aot_value,
-                                           offset, bytes))
-                goto fail;
+            if (is_local_of_aot_value) {
+                if (!aot_checked_addr_list_add(func_ctx, local_idx_of_aot_value,
+                                               offset, bytes))
+                    goto fail;
+            }
         }
     }
 
@@ -321,6 +363,7 @@ aot_check_memory_overflow(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
             aot_set_last_error("llvm build add failed.");
             goto fail;
         }
+
     }
     else {
         LLVMValueRef maddr_base;
