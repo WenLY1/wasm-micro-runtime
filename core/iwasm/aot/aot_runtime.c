@@ -3109,6 +3109,23 @@ aot_check_app_addr_and_convert(AOTModuleInstance *module_inst, bool is_str,
     return ret;
 }
 
+#if WASM_ENABLE_MEMORY64 == 0
+uint64
+aot_bounds_check(AOTModuleInstance *module_inst, uint32 offset, uint32 bytes)
+#else
+uint64
+aot_bounds_check(AOTModuleInstance *module_inst, uint64 offset, uint32 bytes)
+#endif
+{
+    WASMMemoryInstance *memory = aot_get_default_memory(module_inst);
+    uint64 linear_memory_size = memory->memory_data_size;
+
+    if (offset + bytes <= linear_memory_size) {
+        return memory->memory_data + offset;
+    }
+    return NULL;
+}
+
 void *
 aot_memmove(void *dest, const void *src, size_t n)
 {

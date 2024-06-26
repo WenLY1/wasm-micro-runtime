@@ -94,6 +94,40 @@ get_memory_check_bound(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
 static LLVMValueRef
 get_memory_curr_page_count(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx);
 
+static LLVMValueRef
+aot_call_runtime_bounds_check(AOTCompContext *comp_ctx,
+                              AOTFuncContext *func_ctx, LLVMValueRef offset,
+                              uint32 bytes)
+{
+    LLVMValueRef param_values[3], value, maddr, func;
+    LLVMTypeRef param_types[3], ret_type = 0, func_type = 0, func_ptr_type = 0;
+    uint32 argc = 3;
+
+    param_types[0] = INT8_PTR_TYPE;
+#if WASM_ENABLE_MEMORY64 == 0
+    param_types[1] = I32_TYPE;
+#else
+    param_types[1] = I64_TYPE;
+#endif
+    param_types[2] = I32_TYPE;
+    ret_type = INT8_PTR_TYPE;
+
+    param_values[0] = func_ctx->aot_inst;
+    param_values[1] = offset;
+    param_values[2] = I32_CONST(bytes);
+
+    GET_AOT_FUNCTION(aot_bounds_check, argc);
+
+    if (!(maddr = LLVMBuildCall2(comp_ctx->builder, func_type, func,
+                                 param_values, argc, "maddr"))) {
+        aot_set_last_error("llvm build call failed.");
+        goto fail;
+    }
+    return maddr;
+fail:
+    return NULL;
+}
+
 LLVMValueRef
 aot_check_memory_overflow(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
                           mem_offset_t offset, uint32 bytes, bool enable_segue,
@@ -312,7 +346,6 @@ aot_check_memory_overflow(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
                 goto fail;
         }
     }
-
     if (!enable_segue) {
         /* maddr = mem_base_addr + offset1 */
         if (!(maddr =
@@ -337,9 +370,17 @@ aot_check_memory_overflow(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
             goto fail;
         }
     }
+
     return maddr;
 fail:
-    return NULL;
+    if (comp_ctx->enable_bound_check && comp_ctx->enable_runtime_bound_check) {
+        maddr =
+            aot_call_runtime_bounds_check(comp_ctx, func_ctx, offset1, bytes);
+        return maddr;
+    }
+    else {
+        return NULL;
+    }
 }
 
 #define BUILD_PTR_CAST(ptr_type)                                           \
