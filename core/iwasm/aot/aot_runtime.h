@@ -622,6 +622,13 @@ aot_check_app_addr_and_convert(AOTModuleInstance *module_inst, bool is_str,
                                uint64 app_buf_addr, uint64 app_buf_size,
                                void **p_native_addr);
 
+/**
+ * Check whether the memory offset is inside the linear memory
+ */
+uint64
+aot_bounds_check(AOTModuleInstance *module_inst, uint64 offset,
+                        uint32 bytes);
+
 uint32
 aot_get_plt_table_size();
 
