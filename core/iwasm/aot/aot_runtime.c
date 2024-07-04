@@ -3117,13 +3117,7 @@ uint64
 aot_bounds_check(AOTModuleInstance *module_inst, uint64 offset, uint32 bytes)
 #endif
 {
-    WASMMemoryInstance *memory = aot_get_default_memory(module_inst);
-    uint64 linear_memory_size = memory->memory_data_size;
-
-    if (offset + bytes <= linear_memory_size) {
-        return memory->memory_data + offset;
-    }
-    return NULL;
+    return offset;
 }
 
 void *
