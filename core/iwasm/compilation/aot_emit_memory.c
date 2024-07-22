@@ -111,6 +111,168 @@ ffs(int n)
 static LLVMValueRef
 get_memory_curr_page_count(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx);
 
+static LLVMValueRef
+aot_check_const_addr_overflow(AOTCompContext *comp_ctx,
+                              AOTFuncContext *func_ctx, LLVMValueRef addr,
+                              LLVMValueRef mem_base_addr, unsigned int *alignp,
+                              mem_offset_t offset, uint32 bytes,
+                              uint64 const_value, bool enable_segue)
+{
+    uint64 value;
+    LLVMValueRef offset1, maddr;
+    if (LLVMIsEfficientConstInt(addr)) {
+        value = (uint64)LLVMConstIntGetZExtValue(addr);
+    }
+    else {
+        value = const_value;
+    }
+    uint64 mem_offset = value + (uint64)offset;
+    uint32 num_bytes_per_page =
+        comp_ctx->comp_data->memories[0].num_bytes_per_page;
+    uint32 init_page_count = comp_ctx->comp_data->memories[0].init_page_count;
+    uint64 mem_data_size = (uint64)num_bytes_per_page * init_page_count;
+
+    if (alignp != NULL) {
+        /*
+         * A note about max_align below:
+         * the assumption here is the base address of a linear memory
+         * has the natural alignment. for platforms using mmap, it can
+         * be even larger. for now, use a conservative value.
+         */
+        const unsigned int max_align = 8;
+        int shift = ffs((int)(unsigned int)mem_offset);
+        if (shift == 0) {
+            *alignp = max_align;
+        }
+        else {
+            unsigned int align = 1 << (shift - 1);
+            if (align > max_align) {
+                align = max_align;
+            }
+            *alignp = align;
+        }
+    }
+    if (mem_offset + bytes <= mem_data_size) {
+        /* inside memory space */
+        if (comp_ctx->pointer_size == sizeof(uint64))
+            offset1 = I64_CONST(mem_offset);
+        else
+            offset1 = I32_CONST((uint32)mem_offset);
+        CHECK_LLVM_CONST(offset1);
+        if (!enable_segue) {
+            if (!(maddr = LLVMBuildInBoundsGEP2(comp_ctx->builder, INT8_TYPE,
+                                                mem_base_addr, &offset1, 1,
+                                                "maddr"))) {
+                aot_set_last_error("llvm build add failed.");
+                return NULL;
+            }
+        }
+        else {
+            if (!(maddr = LLVMBuildIntToPtr(comp_ctx->builder, offset1,
+                                            INT8_PTR_TYPE_GS, "maddr"))) {
+                aot_set_last_error("llvm build IntToPtr failed.");
+                return NULL;
+            }
+        }
+        return maddr;
+    }
+fail:
+    return NULL;
+}
+
+static LLVMValueRef
+aot_check_out_of_bound(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
+                       LLVMValueRef addr, LLVMValueRef offset_const,
+                       LLVMValueRef mem_base_addr, mem_offset_t offset,
+                       uint32 bytes, AOTValue *aot_value_top,
+                       LLVMBasicBlockRef block_curr,
+                       LLVMBasicBlockRef check_succ)
+{
+    LLVMValueRef offset1, maddr;
+    LLVMValueRef mem_check_bound;
+    LLVMValueRef cmp, cmp1, cmp2;
+    bool is_local_of_aot_value, is_target_64bit;
+    uint32 local_idx_of_aot_value;
+
+    is_local_of_aot_value = aot_value_top->is_local;
+    local_idx_of_aot_value = aot_value_top->local_idx;
+    is_target_64bit = (comp_ctx->pointer_size == sizeof(uint64)) ? true : false;
+
+    /* offset1 = offset + addr; */
+    BUILD_OP(Add, offset_const, addr, offset1, "offset1");
+
+    if (comp_ctx->enable_bound_check
+        && !(is_local_of_aot_value
+             && aot_checked_addr_list_find(func_ctx, local_idx_of_aot_value,
+                                           offset, bytes))) {
+        uint32 init_page_count =
+            comp_ctx->comp_data->memories[0].init_page_count;
+        if (init_page_count == 0) {
+            LLVMValueRef mem_size;
+
+            if (!(mem_size = get_memory_curr_page_count(comp_ctx, func_ctx))) {
+                return NULL;
+            }
+            BUILD_ICMP(LLVMIntEQ, mem_size,
+                       MEMORY64_COND_VALUE(I64_ZERO, I32_ZERO), cmp, "is_zero");
+            ADD_BASIC_BLOCK(check_succ, "check_mem_size_succ");
+            LLVMMoveBasicBlockAfter(check_succ, block_curr);
+            if (!aot_emit_exception(comp_ctx, func_ctx,
+                                    EXCE_OUT_OF_BOUNDS_MEMORY_ACCESS, true, cmp,
+                                    check_succ)) {
+                return NULL;
+            }
+
+            SET_BUILD_POS(check_succ);
+            block_curr = check_succ;
+        }
+
+        if (!(mem_check_bound =
+                  get_memory_check_bound(comp_ctx, func_ctx, bytes))) {
+            return NULL;
+        }
+
+        if (is_target_64bit) {
+            BUILD_ICMP(LLVMIntUGT, offset1, mem_check_bound, cmp, "cmp");
+        }
+        else {
+            /* Check integer overflow */
+            BUILD_ICMP(LLVMIntULT, offset1, addr, cmp1, "cmp1");
+            BUILD_ICMP(LLVMIntUGT, offset1, mem_check_bound, cmp2, "cmp2");
+            BUILD_OP(Or, cmp1, cmp2, cmp, "cmp");
+        }
+
+        /* Add basic blocks */
+        ADD_BASIC_BLOCK(check_succ, "check_succ");
+        LLVMMoveBasicBlockAfter(check_succ, block_curr);
+
+        if (!aot_emit_exception(comp_ctx, func_ctx,
+                                EXCE_OUT_OF_BOUNDS_MEMORY_ACCESS, true, cmp,
+                                check_succ)) {
+            return NULL;
+        }
+
+        SET_BUILD_POS(check_succ);
+
+        if (is_local_of_aot_value) {
+            if (!aot_checked_addr_list_add(func_ctx, local_idx_of_aot_value,
+                                           offset, bytes))
+                return NULL;
+        }
+    }
+
+    /* maddr = mem_base_addr + offset1 */
+    if (!(maddr = LLVMBuildInBoundsGEP2(comp_ctx->builder, INT8_TYPE,
+                                        mem_base_addr, &offset1, 1, "maddr"))) {
+        aot_set_last_error("llvm build add failed.");
+        return NULL;
+    }
+
+    return maddr;
+fail:
+    return NULL;
+}
+
 LLVMValueRef
 aot_check_memory_overflow(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
                           mem_offset_t offset, uint32 bytes, bool enable_segue,
@@ -118,14 +280,13 @@ aot_check_memory_overflow(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
 {
     LLVMValueRef offset_const =
         MEMORY64_COND_VALUE(I64_CONST(offset), I32_CONST(offset));
-    LLVMValueRef addr, maddr, offset1, cmp1, cmp2, cmp;
-    LLVMValueRef mem_base_addr, mem_check_bound;
+    LLVMValueRef addr, maddr;
+    LLVMValueRef mem_base_addr;
     LLVMBasicBlockRef block_curr = LLVMGetInsertBlock(comp_ctx->builder);
     LLVMBasicBlockRef check_succ;
     AOTValue *aot_value_top;
-    uint32 local_idx_of_aot_value = 0;
     uint64 const_value;
-    bool is_target_64bit, is_local_of_aot_value = false;
+    bool is_target_64bit;
     bool is_const = false;
 #if WASM_ENABLE_SHARED_MEMORY != 0
     bool is_shared_memory =
@@ -180,9 +341,7 @@ aot_check_memory_overflow(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
     if (aot_value_top) {
         /* aot_value_top is freed in the following POP_I32(addr),
            so save its fields here for further use */
-        is_local_of_aot_value = aot_value_top->is_local;
         is_const = aot_value_top->is_const;
-        local_idx_of_aot_value = aot_value_top->local_idx;
         const_value = aot_value_top->const_value;
     }
 
@@ -194,62 +353,9 @@ aot_check_memory_overflow(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
      */
     /* return address directly if constant offset and inside memory space */
     if (LLVMIsEfficientConstInt(addr) || is_const) {
-        uint64 value;
-        if (LLVMIsEfficientConstInt(addr)) {
-            value = (uint64)LLVMConstIntGetZExtValue(addr);
-        }
-        else {
-            value = const_value;
-        }
-        uint64 mem_offset = value + (uint64)offset;
-        uint32 num_bytes_per_page =
-            comp_ctx->comp_data->memories[0].num_bytes_per_page;
-        uint32 init_page_count =
-            comp_ctx->comp_data->memories[0].init_page_count;
-        uint64 mem_data_size = (uint64)num_bytes_per_page * init_page_count;
-
-        if (alignp != NULL) {
-            /*
-             * A note about max_align below:
-             * the assumption here is the base address of a linear memory
-             * has the natural alignment. for platforms using mmap, it can
-             * be even larger. for now, use a conservative value.
-             */
-            const unsigned int max_align = 8;
-            int shift = ffs((int)(unsigned int)mem_offset);
-            if (shift == 0) {
-                *alignp = max_align;
-            }
-            else {
-                unsigned int align = 1 << (shift - 1);
-                if (align > max_align) {
-                    align = max_align;
-                }
-                *alignp = align;
-            }
-        }
-        if (mem_offset + bytes <= mem_data_size) {
-            /* inside memory space */
-            if (comp_ctx->pointer_size == sizeof(uint64))
-                offset1 = I64_CONST(mem_offset);
-            else
-                offset1 = I32_CONST((uint32)mem_offset);
-            CHECK_LLVM_CONST(offset1);
-            if (!enable_segue) {
-                if (!(maddr = LLVMBuildInBoundsGEP2(comp_ctx->builder,
-                                                    INT8_TYPE, mem_base_addr,
-                                                    &offset1, 1, "maddr"))) {
-                    aot_set_last_error("llvm build add failed.");
-                    goto fail;
-                }
-            }
-            else {
-                if (!(maddr = LLVMBuildIntToPtr(comp_ctx->builder, offset1,
-                                                INT8_PTR_TYPE_GS, "maddr"))) {
-                    aot_set_last_error("llvm build IntToPtr failed.");
-                    goto fail;
-                }
-            }
+        if ((maddr = aot_check_const_addr_overflow(
+                 comp_ctx, func_ctx, addr, mem_base_addr, alignp, offset, bytes,
+                 const_value, enable_segue))) {
             return maddr;
         }
     }
@@ -267,79 +373,7 @@ aot_check_memory_overflow(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
         }
     }
 
-    /* offset1 = offset + addr; */
-    BUILD_OP(Add, offset_const, addr, offset1, "offset1");
-
-    if (comp_ctx->enable_bound_check
-        && !(is_local_of_aot_value
-             && aot_checked_addr_list_find(func_ctx, local_idx_of_aot_value,
-                                           offset, bytes))) {
-        uint32 init_page_count =
-            comp_ctx->comp_data->memories[0].init_page_count;
-        if (init_page_count == 0) {
-            LLVMValueRef mem_size;
-
-            if (!(mem_size = get_memory_curr_page_count(comp_ctx, func_ctx))) {
-                goto fail;
-            }
-            BUILD_ICMP(LLVMIntEQ, mem_size,
-                       MEMORY64_COND_VALUE(I64_ZERO, I32_ZERO), cmp, "is_zero");
-            ADD_BASIC_BLOCK(check_succ, "check_mem_size_succ");
-            LLVMMoveBasicBlockAfter(check_succ, block_curr);
-            if (!aot_emit_exception(comp_ctx, func_ctx,
-                                    EXCE_OUT_OF_BOUNDS_MEMORY_ACCESS, true, cmp,
-                                    check_succ)) {
-                goto fail;
-            }
-
-            SET_BUILD_POS(check_succ);
-            block_curr = check_succ;
-        }
-
-        if (!(mem_check_bound =
-                  get_memory_check_bound(comp_ctx, func_ctx, bytes))) {
-            goto fail;
-        }
-
-        if (is_target_64bit) {
-            BUILD_ICMP(LLVMIntUGT, offset1, mem_check_bound, cmp, "cmp");
-        }
-        else {
-            /* Check integer overflow */
-            BUILD_ICMP(LLVMIntULT, offset1, addr, cmp1, "cmp1");
-            BUILD_ICMP(LLVMIntUGT, offset1, mem_check_bound, cmp2, "cmp2");
-            BUILD_OP(Or, cmp1, cmp2, cmp, "cmp");
-        }
-
-        /* Add basic blocks */
-        ADD_BASIC_BLOCK(check_succ, "check_succ");
-        LLVMMoveBasicBlockAfter(check_succ, block_curr);
-
-        if (!aot_emit_exception(comp_ctx, func_ctx,
-                                EXCE_OUT_OF_BOUNDS_MEMORY_ACCESS, true, cmp,
-                                check_succ)) {
-            goto fail;
-        }
-
-        SET_BUILD_POS(check_succ);
-
-        if (is_local_of_aot_value) {
-            if (!aot_checked_addr_list_add(func_ctx, local_idx_of_aot_value,
-                                           offset, bytes))
-                goto fail;
-        }
-    }
-
-    if (!enable_segue) {
-        /* maddr = mem_base_addr + offset1 */
-        if (!(maddr =
-                  LLVMBuildInBoundsGEP2(comp_ctx->builder, INT8_TYPE,
-                                        mem_base_addr, &offset1, 1, "maddr"))) {
-            aot_set_last_error("llvm build add failed.");
-            goto fail;
-        }
-    }
-    else {
+    if (enable_segue) {
         LLVMValueRef maddr_base;
 
         if (!(maddr_base = LLVMBuildIntToPtr(comp_ctx->builder, addr,
@@ -353,8 +387,14 @@ aot_check_memory_overflow(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
             aot_set_last_error("llvm build inboundgep failed.");
             goto fail;
         }
+        return maddr;
     }
-    return maddr;
+    else {
+        return aot_check_out_of_bound(comp_ctx, func_ctx, addr, offset_const,
+                                      mem_base_addr, offset, bytes,
+                                      aot_value_top, block_curr, check_succ);
+    }
+
 fail:
     return NULL;
 }
