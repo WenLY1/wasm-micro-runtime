@@ -111,6 +111,40 @@ ffs(int n)
 static LLVMValueRef
 get_memory_curr_page_count(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx);
 
+static LLVMValueRef
+aot_call_runtime_bounds_check(AOTCompContext *comp_ctx,
+                              AOTFuncContext *func_ctx, LLVMValueRef offset,
+                              uint32 bytes)
+{
+    LLVMValueRef param_values[3], value, offset2, func;
+    LLVMTypeRef param_types[3], ret_type = 0, func_type = 0, func_ptr_type = 0;
+    uint32 argc = 3;
+
+    param_types[0] = INT8_PTR_TYPE;
+#if WASM_ENABLE_MEMORY64 == 0
+    param_types[1] = I32_TYPE;
+#else
+    param_types[1] = I64_TYPE;
+#endif
+    param_types[2] = I32_TYPE;
+    ret_type = INT8_PTR_TYPE;
+
+    param_values[0] = func_ctx->aot_inst;
+    param_values[1] = offset;
+    param_values[2] = I32_CONST(bytes);
+
+    GET_AOT_FUNCTION(aot_bounds_check, argc);
+
+    if (!(offset2 = LLVMBuildCall2(comp_ctx->builder, func_type, func,
+                                 param_values, argc, "offset2"))) {
+        aot_set_last_error("llvm build call failed.");
+        goto fail;
+    }
+    return offset2;
+fail:
+    return NULL;
+}
+
 LLVMValueRef
 aot_check_memory_overflow(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
                           mem_offset_t offset, uint32 bytes, bool enable_segue,
@@ -118,10 +152,11 @@ aot_check_memory_overflow(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
 {
     LLVMValueRef offset_const =
         MEMORY64_COND_VALUE(I64_CONST(offset), I32_CONST(offset));
-    LLVMValueRef addr, maddr, offset1, cmp1, cmp2, cmp;
+    LLVMValueRef addr, maddr, offset1, offset2, cmp1, cmp2, cmp;
     LLVMValueRef mem_base_addr, mem_check_bound;
     LLVMBasicBlockRef block_curr = LLVMGetInsertBlock(comp_ctx->builder);
-    LLVMBasicBlockRef check_succ;
+    LLVMBasicBlockRef check_succ, runtime_bounds_check;
+    LLVMValueRef phi;
     AOTValue *aot_value_top;
     uint32 local_idx_of_aot_value = 0;
     uint64 const_value;
@@ -187,7 +222,6 @@ aot_check_memory_overflow(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
     }
 
     POP_MEM_OFFSET(addr);
-
     /*
      * Note: not throw the integer-overflow-exception here since it must
      * have been thrown when converting float to integer before
@@ -313,23 +347,40 @@ aot_check_memory_overflow(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
 
         /* Add basic blocks */
         ADD_BASIC_BLOCK(check_succ, "check_succ");
-        LLVMMoveBasicBlockAfter(check_succ, block_curr);
-
-        if (!aot_emit_exception(comp_ctx, func_ctx,
-                                EXCE_OUT_OF_BOUNDS_MEMORY_ACCESS, true, cmp,
-                                check_succ)) {
-            goto fail;
-        }
-
-        SET_BUILD_POS(check_succ);
-
         if (is_local_of_aot_value) {
             if (!aot_checked_addr_list_add(func_ctx, local_idx_of_aot_value,
                                            offset, bytes))
                 goto fail;
         }
-    }
+        if (comp_ctx->enable_runtime_bound_check) {
+            ADD_BASIC_BLOCK(runtime_bounds_check, "runtime_bounds_check");
+            LLVMBuildCondBr(comp_ctx->builder, cmp, runtime_bounds_check,
+                            check_succ);
+            SET_BUILD_POS(runtime_bounds_check);
+            offset2 = aot_call_runtime_bounds_check(comp_ctx, func_ctx, offset1,
+                                                    bytes);
+            // todo: store offset2 in the local
+            LLVMBuildBr(comp_ctx->builder, check_succ);
+        } else {
+            if (!aot_emit_exception(comp_ctx, func_ctx,
+                                    EXCE_OUT_OF_BOUNDS_MEMORY_ACCESS, true, cmp,
+                                    check_succ)) {
+                goto fail;
+            }
+        }
 
+        SET_BUILD_POS(check_succ);
+
+        if (comp_ctx->enable_runtime_bound_check) {
+            phi = LLVMBuildPhi(comp_ctx->builder,
+                               is_target_64bit ? I64_TYPE : I32_TYPE, "phi");
+            LLVMValueRef incoming_values[] = { offset1, offset2 };
+            LLVMBasicBlockRef incoming_blocks[] = { block_curr,
+                                                    runtime_bounds_check };
+            LLVMAddIncoming(phi, incoming_values, incoming_blocks, 2);
+            offset1 = phi;
+        }
+    }
     if (!enable_segue) {
         /* maddr = mem_base_addr + offset1 */
         if (!(maddr =
@@ -354,6 +405,7 @@ aot_check_memory_overflow(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
             goto fail;
         }
     }
+
     return maddr;
 fail:
     return NULL;
